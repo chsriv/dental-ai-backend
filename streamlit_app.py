@@ -3,19 +3,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models, transforms
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import pandas as pd
 import numpy as np
+import io
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="DentAI Clinical", layout="wide")
+st.set_page_config(page_title="DentAI Clinical Precision", layout="wide")
 
-# --- CLEAN UI STYLING ---
+# --- CLEAN UI THEME ---
 st.markdown("""
     <style>
-    .stTable { background-color: white; }
-    .stDataFrame { border: 1px solid #e6e9ef; border-radius: 8px; }
-    [data-testid="stMetricValue"] { color: #0052cc; font-family: monospace; }
+    .main { background-color: #ffffff; }
+    .stSidebar { background-color: #f8f9fa; border-right: 1px solid #dee2e6; }
+    .stTable { font-size: 12px; }
+    div[data-testid="stMetricValue"] { color: #0052cc; font-family: 'Courier New', Courier, monospace; }
     </style>
 """, unsafe_allow_html=True)
 
@@ -27,42 +29,55 @@ def load_expert_model():
         model.load_state_dict(torch.load("dental_ai_final.pth", map_location="cpu"))
         model.eval()
         return model
-    except:
+    except Exception as e:
+        st.error(f"Model Load Error: {e}")
         return None
 
 model = load_expert_model()
 categories = ['Cavity', 'Fillings', 'Implant', 'Impacted Tooth', 'Normal']
 
-# --- PRECISION ARCH LOGIC ---
-def get_precision_coords(fdi, x_nudge, y_stretch, arch_width):
-    # Base X-map with high-density spacing for incisors
-    x_map = {1:0.48, 2:0.44, 3:0.40, 4:0.35, 5:0.29, 6:0.22, 7:0.15, 8:0.08}
+# --- ANATOMICAL COORDINATE ENGINE (NON-LINEAR) ---
+def get_calibrated_coords(fdi, x_nudge, y_base, squeeze, arch_width, curve):
+    """
+    squeeze: Controls how tightly packed the front teeth (11, 21, 31, 41) are.
+    arch_width: Overall scale of the jaw.
+    """
+    # X-Positioning: 1 is midline, 8 is molar.
     pos = fdi % 10
+    # Use a power function to squeeze the center teeth closer than the molars
+    raw_x = (pos - 1) * 0.06 
+    squeezed_x = (raw_x ** squeeze) * arch_width
     
-    # Calculate Raw X
-    if fdi in range(11, 19) or fdi in range(41, 49): # Patient Right
-        x = 0.5 - (x_map[pos] * arch_width)
+    # Determine Quadrant
+    if fdi in [11,12,13,14,15,16,17,18, 41,42,43,44,45,46,47,48]: # Patient Right
+        x = 0.5 - 0.015 - squeezed_x # 0.015 is the midline gap
     else: # Patient Left
-        x = 0.5 + (x_map[pos] * arch_width)
-    
-    x += x_nudge # Fine-tune horizontal shift
-    
-    # Calculate Parabolic Y
+        x = 0.5 + 0.015 + squeezed_x
+
+    x += x_nudge
+
+    # Y-Positioning: The Parabolic 'Smile' Line
     dist_from_center = abs(0.5 - x)
     if fdi < 30: # Upper
-        y = 0.35 + (y_stretch * (dist_from_center**2))
+        y = y_base - 0.05 + (curve * (dist_from_center**1.8))
     else: # Lower
-        y = 0.80 - (y_stretch * (dist_from_center**2))
+        y = y_base + 0.05 - (curve * (dist_from_center**1.8))
         
     return x, y
 
-# --- SIDEBAR CALIBRATION (High Sensitivity) ---
-st.sidebar.header("🎯 Precision Calibration")
-x_nudge = st.sidebar.slider("Horizontal Shift (Center)", -0.10, 0.10, 0.0, 0.005)
-arch_width = st.sidebar.slider("Arch Width (Scale)", 0.5, 1.5, 1.0, 0.01)
-y_stretch = st.sidebar.slider("Vertical Arch Lift", 0.0, 1.0, 0.3, 0.01)
+# --- SIDEBAR: SURGICAL CALIBRATION ---
+st.sidebar.header("🎯 Anatomical Calibration")
+st.sidebar.markdown("Fine-tune the dots to align with tooth crowns.")
 
-uploaded_file = st.file_uploader("Upload Patient OPG", type=["jpg", "png", "jpeg"])
+x_nudge = st.sidebar.slider("Global Shift (L/R)", -0.15, 0.15, 0.0, 0.001)
+y_base = st.sidebar.slider("Vertical Center (Y)", 0.20, 0.80, 0.52, 0.002)
+squeeze = st.sidebar.slider("Anterior Squeeze (Closer)", 0.8, 1.5, 1.15, 0.01)
+arch_width = st.sidebar.slider("Total Arch Width", 0.5, 1.5, 0.95, 0.01)
+curve = st.sidebar.slider("Smile Curve Intensity", 0.0, 1.5, 0.65, 0.01)
+
+# --- MAIN APP ---
+st.title("🦷 DentAI | Full-Arch Clinical Workstation")
+uploaded_file = st.file_uploader("Upload OPG for Automated 32-Tooth Scan", type=["jpg", "png", "jpeg"])
 
 if uploaded_file:
     image = Image.open(uploaded_file).convert("RGB")
@@ -74,41 +89,56 @@ if uploaded_file:
     
     results = []
     
-    # Scan and Draw
+    # Pre-processing
+    preprocess = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+
     for fdi in fdi_list:
-        x_r, y_r = get_precision_coords(fdi, x_nudge, y_stretch, arch_width)
+        x_r, y_r = get_calibrated_coords(fdi, x_nudge, y_base, squeeze, arch_width, curve)
         px, py = x_r * w, y_r * h
         
-        # Crop for AI
+        # Crop logic
         box = (px-30, py-40, px+30, py+40)
         crop = image.crop(box)
         
-        # Clinical Check
-        if np.mean(np.array(crop.convert('L'))) < 40:
-            diag, conf, color = "Missing", 0.99, "#FFD700" # Gold
+        # Clinical Analysis
+        if np.mean(np.array(crop.convert('L'))) < 35:
+            diag, conf, color = "Missing", 0.99, "#FFD700"
         else:
-            diag, conf, color = "Normal", 0.85, "#00FF00" # Clinical Green
-            # (Inference block omitted for brevity, logic remains same)
+            if model:
+                input_t = preprocess(crop).unsqueeze(0)
+                with torch.no_grad():
+                    out = model(input_t)
+                    prob = F.softmax(out, dim=1)
+                    conf_val, pred = torch.max(prob, dim=1)
+                    diag, conf = categories[pred.item()], conf_val.item()
+                color = "#FF0000" if diag in ["Cavity", "Impacted Tooth"] else "#00FF00"
+            else:
+                diag, conf, color = "Scan Ready", 0.0, "#0052cc"
 
-        # Draw Clean Markers
-        draw.ellipse([px-10, py-10, px+10, py+10], outline=color, width=3)
+        # Draw Precision Markers
+        draw.rectangle([px-10, py-10, px+10, py+10], outline=color, width=3)
         draw.text((px-8, py-35), str(fdi), fill=color)
 
         results.append({"Tooth": fdi, "Finding": diag, "Conf": f"{conf*100:.1f}%"})
 
-    # --- DISPLAY ---
-    col1, col2 = st.columns([1.5, 1])
+    # --- UI LAYOUT ---
+    col_img, col_tbl = st.columns([1.6, 1])
     
-    with col1:
-        st.subheader("Calibrated OPG View")
+    with col_img:
+        st.subheader("Interactive Calibrated View")
         st.image(image, use_container_width=True)
-        st.caption("Use sidebar sliders to align dots perfectly to the tooth crowns.")
+        st.caption("Adjust 'Anterior Squeeze' if the center dots are too wide.")
 
-    with col2:
-        st.subheader("Clinical Findings")
+    with col_tbl:
+        st.subheader("Clinical Diagnostic Report")
         df = pd.DataFrame(results)
-        # Use simple table to avoid 'black line' glitch
-        st.table(df)
+        st.table(df) # table used to prevent black-line scrolling glitch
 
-    if st.button("💾 Finalize & Save to Patient Record"):
-        st.success(f"Visit PFP updated for PX-8529.")
+    if st.button("💾 SAVE REPORT & UPDATE PFP"):
+        st.success("Analysis finalized for Patient PX-8529.")
+else:
+    st.info("Please upload an OPG to begin anatomical alignment.")

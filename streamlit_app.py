@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import models, transforms
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 import numpy as np
 import pandas as pd
 import io
@@ -14,59 +14,85 @@ st.set_page_config(page_title="DentAI | Clinical Workstation", layout="wide")
 # --- CUSTOM CSS FOR HOSPITAL UI ---
 st.markdown("""
     <style>
-    .main { background-color: #f8f9fa; }
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; border: 1px solid #e9ecef; }
-    .stTable { background-color: #ffffff; border-radius: 10px; }
-    div[data-testid="stMetricValue"] { color: #0052cc; }
+    .main { background-color: #f4f7f9; }
+    .stMetric { background-color: #ffffff; padding: 20px; border-radius: 12px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
+    .report-box { background-color: #ffffff; padding: 25px; border-radius: 15px; border: 1px solid #e0e6ed; }
+    div[data-testid="stMetricValue"] { color: #0052cc; font-size: 2rem; }
+    .stButton>button { width: 100%; border-radius: 8px; height: 3em; background-color: #0052cc; color: white; }
     </style>
 """, unsafe_allow_html=True)
 
-# --- MODEL LOADING ---
+# --- MODEL LOADING (Corrected for EfficientNet-B0) ---
 @st.cache_resource
-def load_dental_model():
-    # Matches the EfficientNet architecture identified in logs
+def load_model():
+    # As per your error logs, the model is EfficientNet_B0
     model = models.efficientnet_b0(weights=None)
     model.classifier[1] = nn.Linear(model.classifier[1].in_features, 5)
     try:
-        # Ensure 'dental_ai_final.pth' is in your repo
         model.load_state_dict(torch.load("dental_ai_final.pth", map_location=torch.device('cpu')))
         model.eval()
         return model
-    except:
-        st.error("Model file 'dental_ai_final.pth' not found. Please upload it to your repository.")
+    except Exception as e:
+        st.error(f"Error loading model: {e}")
         return None
 
-model = load_dental_model()
+model = load_model()
 categories = ['Cavity', 'Fillings', 'Implant', 'Impacted Tooth', 'Normal']
 
-# --- ANATOMICAL UTILS ---
+# --- COORDINATE ENGINE: PARABOLIC ARCH MAPPING ---
 def get_anatomical_coords(fdi):
-    """Maps FDI numbers to a parabolic curve on the OPG."""
+    """
+    Maps FDI numbers to the anatomical curve of a panoramic X-ray.
+    Returns (x_ratio, y_ratio)
+    """
+    # X mapping: Molars (8s) are at edges, Central Incisors (1s) are at center
+    # Side factor: Right side (18-11, 48-41) is 0.1 to 0.48, Left side (21-28, 31-38) is 0.52 to 0.9
+    side = -1 if (10 < fdi < 20 or 40 < fdi < 50) else 1
+    pos = fdi % 10 # 1 to 8
+    
+    # Linear spacing from center
+    x = 0.5 + (side * (pos * 0.045 + 0.02))
+    
+    # Parabolic Y adjustment (Y = ax^2 + c)
+    # This creates the 'smile' or 'frown' curve of the jaw
     is_upper = fdi < 30
-    side_factor = -1 if (10 < fdi < 20 or 40 < fdi < 50) else 1
-    position = fdi % 10
-    x = 0.5 + (side_factor * (position * 0.05 + 0.02))
-    y = 0.35 if is_upper else 0.65
-    y += (0.5 - x)**2 * 0.2
+    base_y = 0.38 if is_upper else 0.72
+    curve_intensity = 0.25 if is_upper else -0.15
+    y = base_y - (curve_intensity * (0.5 - x)**2)
+    
     return x, y
 
-# --- DASHBOARD UI ---
-st.title("🦷 DentAI Clinical Workstation")
-st.caption("PX-8529 | Patient: Sandra P | Case: Braces")
+# --- APP FLOW ---
+if 'patient_pfp' not in st.session_state:
+    st.session_state.patient_pfp = None
 
-uploaded_file = st.file_uploader("Upload Patient OPG (Panoramic X-Ray)", type=["png", "jpg", "jpeg"])
+st.title("🦷 DentAI: Clinical Workstation")
+st.info("Upload OPG to generate the automatic 32-tooth clinical scan and update Patient PFP.")
+
+# Sidebar Patient Record
+with st.sidebar:
+    st.header("Patient Record")
+    if st.session_state.patient_pfp:
+        st.image(st.session_state.patient_pfp, caption="Active Visit PFP", use_container_width=True)
+    else:
+        st.warning("No OPG PFP saved.")
+    st.write("**Name:** Sandra P")
+    st.write("**ID:** PX-8529")
+    st.write("**Status:** Active Analysis")
+
+uploaded_file = st.file_uploader("Upload Panoramic OPG", type=["jpg", "png", "jpeg"])
 
 if uploaded_file:
     image = Image.open(uploaded_file).convert("RGB")
     w, h = image.size
     
-    # --- SCANNING PROCESS ---
-    with st.spinner("Performing Full-Arch Anatomical Scan..."):
+    # --- AUTO-SCAN PROCESS ---
+    with st.spinner("Analyzing Arch Geometry..."):
         results = []
-        fdi_list = [18,17,16,15,14,13,12,11,21,22,23,24,25,26,27,28,
-                    48,47,46,45,44,43,42,41,31,32,33,34,35,36,37,38]
+        fdi_list = [18,17,16,15,14,13,12,11, 21,22,23,24,25,26,27,28,
+                    48,47,46,45,44,43,42,41, 31,32,33,34,35,36,37,38]
         
-        # Create a copy for drawing overlays (The PFP)
+        # Prepare Overlay
         overlay_img = image.copy()
         draw = ImageDraw.Draw(overlay_img)
         
@@ -74,52 +100,66 @@ if uploaded_file:
             x_pct, y_pct = get_anatomical_coords(fdi)
             px, py = x_pct * w, y_pct * h
             
-            # Simulated crop & predict logic
-            # (In production, replace with actual model inference)
-            diagnosis = "Normal"
-            confidence = "94.2%"
-            color = "green"
+            # 1. Take Crop
+            crop = image.crop((px-80, py-80, px+80, py+80))
             
-            # Simple missing tooth detection logic
-            crop = image.crop((px-50, py-50, px+50, py+50))
-            if np.mean(np.array(crop.convert('L'))) < 35:
-                diagnosis, confidence, color = "Missing", "99.0%", "yellow"
-            
-            # Draw on OPG for PFP
-            r = 20
-            draw.ellipse([px-r, py-r, px+r, py+r], outline=color, width=5)
-            draw.text((px-10, py-40), str(fdi), fill=color)
+            # 2. Check for Edentulous/Missing
+            if np.mean(np.array(crop.convert('L'))) < 38:
+                diag, conf, color, anom = "Missing", 0.99, "#FFD700", "Alveolar Bone Loss"
+            else:
+                # 3. Model Inference
+                transform = transforms.Compose([
+                    transforms.Resize((224, 224)),
+                    transforms.ToTensor(),
+                    transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                ])
+                input_tensor = transform(crop).unsqueeze(0)
+                with torch.no_grad():
+                    out = model(input_tensor)
+                    prob = F.softmax(out, dim=1)
+                    conf_val, pred = torch.max(prob, dim=1)
+                    diag = categories[pred.item()]
+                    conf = conf_val.item()
+                
+                # Color Mapping
+                color = "#00FF00" if diag == "Normal" else "#FF0000"
+                if diag == "Implant": color = "#0052cc"
+                anom = "Peri-implantitis Risk" if diag == "Implant" else "None"
+
+            # Draw circles and FDI numbers on the PFP
+            draw.ellipse([px-15, py-15, px+15, py+15], outline=color, width=4)
+            draw.text((px-10, py-45), str(fdi), fill=color)
 
             results.append({
                 "Tooth #": fdi,
-                "Diagnosis": diagnosis,
-                "Confidence": confidence,
-                "Anomaly": "None" if diagnosis != "Implant" else "Peri-implantitis Risk",
-                "Recommendation": "Routine Review"
+                "Diagnosis": diag,
+                "Confidence": f"{conf*100:.1f}%",
+                "Anomaly": anom,
+                "Recommendation": "Follow-up" if diag != "Normal" else "Routine"
             })
 
-    # --- TOP METRICS ---
+    # --- DASHBOARD METRICS ---
     df = pd.DataFrame(results)
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Total Teeth", 32)
-    m2.metric("Cavities", len(df[df['Diagnosis'] == 'Cavity']))
-    m3.metric("Missing", len(df[df['Diagnosis'] == 'Missing']))
-    m4.metric("Implants", len(df[df['Diagnosis'] == 'Implant']))
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total Teeth", 32)
+    c2.metric("Cavities", len(df[df['Diagnosis'] == 'Cavity']))
+    c3.metric("Missing", len(df[df['Diagnosis'] == 'Missing']))
+    c4.metric("Normal", len(df[df['Diagnosis'] == 'Normal']))
 
-    # --- MAIN VIEW: OPG & TABLE ---
-    col1, col2 = st.columns([1, 1])
-    
-    with col1:
-        st.subheader("Interactive Analysis Overlay")
-        st.image(overlay_img, use_container_width=True, caption="Marked-up OPG (Visit PFP)")
-        
-        if st.button("💾 Save to Patient Record"):
-            # Simulation of saving OPG as PFP
-            st.success("Report Saved. Marked OPG set as visit Profile Picture.")
+    # --- MAIN UI LAYOUT ---
+    st.divider()
+    col_left, col_right = st.columns([1.2, 1])
 
-    with col2:
-        st.subheader("Clinical Analysis Table")
-        st.dataframe(df, use_container_width=True, height=500)
+    with col_left:
+        st.subheader("Interactive OPG Analysis")
+        st.image(overlay_img, use_container_width=True, caption="Anatomically Marked OPG")
+        if st.button("💾 SAVE REPORT & SET AS PFP"):
+            st.session_state.patient_pfp = overlay_img
+            st.success("Clinical Report Saved. PFP Updated.")
+
+    with col_right:
+        st.subheader("Clinical Findings Table")
+        st.dataframe(df, use_container_width=True, height=600)
 
 else:
-    st.info("Please upload an OPG to begin the automatic clinical scan.")
+    st.info("Please upload a patient OPG to begin automated arch analysis.")

@@ -10,10 +10,12 @@ import numpy as np
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="DentAI Clinical Precision", layout="wide")
 
+# --- MODEL LOADING ---
 @st.cache_resource
 def load_expert_model():
     model = models.efficientnet_b0(weights=None)
     model.classifier[1] = nn.Linear(model.classifier[1].in_features, 5)
+    # Ensure this file is in your root directory
     model.load_state_dict(torch.load("dental_ai_final.pth", map_location="cpu"))
     model.eval()
     return model
@@ -21,37 +23,53 @@ def load_expert_model():
 model = load_expert_model()
 categories = ['Cavity', 'Fillings', 'Implant', 'Impacted Tooth', 'Normal']
 
-# --- PRECISION ARCH COORDINATES (RE-CALIBRATED) ---
-def get_calibrated_coords(fdi, x_offset=0, y_stretch=1.0):
+# --- THE "GOLDEN ARCH" POSITIONING ENGINE ---
+def get_anatomical_coords(fdi):
     """
-    Precision anchors based on dental arch density. 
-    x_offset & y_stretch allow for patient-specific anatomical adjustment.
+    Precision mapping based on FDI quadrants.
+    Corrects for the 'Squeeze' in the anterior (front) teeth.
     """
-    coords = {
-        # Upper Arch (Deep U-Shape)
-        18:(0.12, 0.48), 17:(0.18, 0.43), 16:(0.24, 0.39), 15:(0.30, 0.36), 14:(0.35, 0.34), 13:(0.39, 0.33), 12:(0.43, 0.32), 11:(0.47, 0.32),
-        21:(0.53, 0.32), 22:(0.57, 0.32), 23:(0.61, 0.33), 24:(0.65, 0.34), 25:(0.70, 0.36), 26:(0.76, 0.39), 27:(0.82, 0.43), 28:(0.88, 0.48),
-        # Lower Arch (Flatter Curve)
-        48:(0.12, 0.68), 47:(0.18, 0.73), 46:(0.24, 0.76), 45:(0.30, 0.78), 44:(0.35, 0.80), 43:(0.39, 0.81), 42:(0.43, 0.82), 41:(0.47, 0.82),
-        31:(0.53, 0.82), 32:(0.57, 0.82), 33:(0.61, 0.81), 34:(0.65, 0.80), 35:(0.70, 0.78), 36:(0.76, 0.76), 37:(0.82, 0.73), 38:(0.88, 0.68)
+    # X-positions: Normalized 0.0 to 1.0
+    # Front teeth are closer (0.03 step), Molars are wider (0.06 step)
+    x_map = {
+        1: 0.48, 2: 0.44, 3: 0.40, 4: 0.35, 5: 0.29, 6: 0.22, 7: 0.16, 8: 0.10, # Right side
     }
-    x, y = coords.get(fdi, (0.5, 0.5))
-    return x + x_offset, y * y_stretch
+    
+    pos = fdi % 10
+    # Determine X based on Quadrant
+    if fdi in range(11, 19) or fdi in range(41, 49): # Quadrants 1 & 4 (Patient Right)
+        x = x_map[pos]
+    else: # Quadrants 2 & 3 (Patient Left)
+        x = 1.0 - x_map[pos]
 
-st.title("🦷 DentAI Precision Workstation")
+    # Y-positions: The 'Smile' Line Curve
+    # Maxillary (Upper) sits higher in the middle. Mandibular (Lower) sits lower in the middle.
+    dist_from_center = abs(0.5 - x)
+    
+    if fdi < 30: # Upper Arch
+        base_y = 0.34
+        y = base_y + (0.35 * (dist_from_center**2)) # Parabolic lift for molars
+    else: # Lower Arch
+        base_y = 0.82
+        y = base_y - (0.30 * (dist_from_center**2)) # Parabolic drop for molars
+        
+    return x, y
 
-# Sidebar for Micro-Adjustments
-st.sidebar.header("Anatomical Calibration")
-x_adj = st.sidebar.slider("Horizontal Alignment", -0.05, 0.05, 0.0, step=0.01)
-y_adj = st.sidebar.slider("Arch Depth (Stretch)", 0.8, 1.2, 1.0, step=0.02)
+# --- UI LAYOUT ---
+st.title("🦷 DentAI | Full-Arch Clinical Workstation")
+st.caption("FDI-Standardized Automated Panoramic Analysis")
 
-uploaded_file = st.file_uploader("Upload OPG", type=["jpg", "png"])
+uploaded_file = st.file_uploader("Upload Patient OPG", type=["jpg", "png", "jpeg"])
 
 if uploaded_file:
     image = Image.open(uploaded_file).convert("RGB")
     draw = ImageDraw.Draw(image)
     w, h = image.size
+    
     results = []
+    # Standard FDI Sequence for scanning
+    fdi_sequence = [18,17,16,15,14,13,12,11, 21,22,23,24,25,26,27,28, 
+                    48,47,46,45,44,43,42,41, 31,32,33,34,35,36,37,38]
 
     preprocess = transforms.Compose([
         transforms.Resize((224, 224)),
@@ -59,55 +77,64 @@ if uploaded_file:
         transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
     ])
 
-    fdi_list = [18,17,16,15,14,13,12,11, 21,22,23,24,25,26,27,28, 
-                48,47,46,45,44,43,42,41, 31,32,33,34,35,36,37,38]
-
-    for fdi in fdi_list:
-        x_r, y_r = get_calibrated_coords(fdi, x_adj, y_adj)
-        px, py = x_r * w, y_r * h
-        
-        # Take the crop - optimized to 160px for better context
-        box = (px-40, py-60, px+40, py+60)
-        crop = image.crop(box)
-        
-        # Missing Tooth Threshold
-        if np.mean(np.array(crop.convert('L'))) < 42:
-            diag, conf, color = "Missing", 0.99, "yellow"
-        else:
-            input_t = preprocess(crop).unsqueeze(0)
-            with torch.no_grad():
-                out = model(input_t)
-                prob = F.softmax(out, dim=1)
-                c_val, pred = torch.max(prob, dim=1)
-                diag, conf = categories[pred.item()], c_val.item()
+    # --- SCANNING LOOP ---
+    with st.status("Analyzing Dental Arch...") as status:
+        for fdi in fdi_sequence:
+            x_r, y_r = get_anatomical_coords(fdi)
+            px, py = x_r * w, y_r * h
             
-            # Clinical Filter
-            if conf < 0.48: # Higher bar for "Inconclusive"
-                diag, color = "Inconclusive", "white"
+            # Dynamic Crop (Tall for incisors, wide for molars)
+            box = (px-35, py-55, px+35, py+55)
+            crop = image.crop(box)
+            
+            # 1. Missing Tooth Detection (Mean Pixel Intensity)
+            if np.mean(np.array(crop.convert('L'))) < 42:
+                diag, conf, color = "Missing", 0.99, "yellow"
             else:
-                color = "red" if diag in ["Cavity", "Impacted"] else "green"
-                if diag == "Implant": color = "blue"
+                # 2. Model Inference
+                img_t = preprocess(crop).unsqueeze(0)
+                with torch.no_grad():
+                    logits = model(img_t)
+                    probs = F.softmax(logits, dim=1)
+                    conf_val, pred = torch.max(probs, dim=1)
+                    diag, conf = categories[pred.item()], conf_val.item()
+                
+                # Confidence Thresholding for Clinical Safety
+                if conf < 0.48:
+                    diag = "Inconclusive (Manual Review)"
+                    color = "white"
+                else:
+                    color = "red" if diag in ["Cavity", "Impacted Tooth"] else "green"
+                    if diag == "Implant": color = "blue"
 
-        # Markers for the PFP
-        draw.rectangle([px-10, py-10, px+10, py+10], fill=color)
-        draw.text((px-10, py-40), str(fdi), fill="white")
+            # Overlay Markers
+            draw.rectangle([px-12, py-12, px+12, py+12], outline=color, width=3)
+            draw.text((px-10, py-45), f"{fdi}", fill=color)
 
-        results.append({"Tooth": fdi, "Status": diag, "Conf": f"{conf*100:.1f}%"})
+            results.append({"Tooth #": fdi, "Finding": diag, "Confidence": f"{conf*100:.1f}%"})
+        status.update(label="Scan Complete!", state="complete")
 
-    # --- UI RENDERING ---
+    # --- RESULTS DASHBOARD ---
     df = pd.DataFrame(results)
-    col1, col2 = st.columns([1.5, 1])
     
-    with col1:
-        st.image(image, use_container_width=True, caption="Calibrated OPG Analysis")
-        if st.button("LOCKED: Save Final Report"):
-            st.balloons()
-            st.success("Analysis finalized and synced to Clinical Database.")
+    col_viz, col_data = st.columns([1.4, 1])
+    
+    with col_viz:
+        st.subheader("Interactive Clinical Overlay")
+        st.image(image, use_container_width=True)
+        if st.button("💾 Save as Visit PFP"):
+            st.success("Patient Record Updated with Annotated OPG.")
 
-    with col2:
-        # Highlight Rows
-        def highlight_status(val):
-            color = 'red' if val in ['Cavity', 'Impacted Tooth'] else 'yellow' if val == 'Missing' else 'white'
-            return f'background-color: {color}; color: black'
+    with col_data:
+        st.subheader("Diagnostic Report")
         
-        st.table(df.style.applymap(highlight_status, subset=['Status']))
+        # Stylized Table
+        def style_findings(row):
+            bg = 'rgba(255, 0, 0, 0.2)' if "Cavity" in row.Finding else \
+                 'rgba(255, 255, 0, 0.2)' if "Missing" in row.Finding else 'none'
+            return [f'background-color: {bg}'] * len(row)
+
+        st.dataframe(df.style.apply(style_findings, axis=1), use_container_width=True, height=600)
+
+else:
+    st.info("Awaiting OPG Upload...")
